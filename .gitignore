@@ -1,0 +1,45 @@
+# ──────────────────────────────────────────────
+# sd_tools — .gitignore
+# ──────────────────────────────────────────────
+
+# ── Backup images produced by sd_tools.sh ─────
+images/
+*.img
+*.img.gz
+
+# ── Runtime log file ──────────────────────────
+sd_manager.log
+*.log
+
+# ── Temporary files created by the script ─────
+/tmp/sd_flash_worker.sh
+
+# ── OS-generated junk ─────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ── Editor / IDE metadata ─────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# ── Shell debug / test artifacts ──────────────
+*.bak
+*.tmp
+*.orig
+
+# ── Python cache (used inline by the script) ──
+__pycache__/
+*.pyc
+*.pyo
