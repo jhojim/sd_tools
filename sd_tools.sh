@@ -2,6 +2,10 @@
 # Exit immediately if a command exits with a non-zero status
 set -e
 
+# Force English locale for all dialogs and tools
+export LC_ALL=C.UTF-8
+export LANG=C.UTF-8
+
 # --- MASTER CONFIGURATION ---
 export NEWT_COLORS='
   root=,blue
@@ -52,7 +56,7 @@ log_msg() {
 }
 
 check_dependencies() {
-    local REQUIRED_PACKAGES="coreutils parted e2fsprogs mount gzip whiptail dosfstools python3 tmux"
+    local REQUIRED_PACKAGES="coreutils parted e2fsprogs mount gzip whiptail dosfstools python3 tmux pv"
     local MISSING_PACKAGES=""
     for pkg in $REQUIRED_PACKAGES; do
         if ! dpkg -s "$pkg" >/dev/null 2>&1; then
@@ -72,26 +76,41 @@ select_device() {
     local tempfile=$(mktemp)
     local DEVICES_LIST=$(lsblk -d -P -o NAME,SIZE,RM,MODEL -e 7)
     local ARGS=()
+    local DEVICE_COUNT=0
 
     while read -r line; do
         eval "$line"
         if [ "$RM" == "1" ] && [ "$SIZE" != "0B" ] && [ -n "$SIZE" ]; then
             ARGS+=("$NAME" "$SIZE $MODEL")
+            DEVICE_COUNT=$((DEVICE_COUNT+1))
         fi
     done <<< "$DEVICES_LIST"
 
-    if [ ${#ARGS[@]} -eq 0 ]; then
+    if [ $DEVICE_COUNT -eq 0 ]; then
         whiptail --title "Error" --msgbox "No removable devices found!" 8 45
         rm -f "$tempfile"
         return 1
     fi
 
-    whiptail --title "$title" --menu "Select the SD card device:" 15 60 5 "${ARGS[@]}" 2> "$tempfile"
-    local ret=$?
-    local DEVICE=$(cat "$tempfile")
-    rm -f "$tempfile"
+    # Append separator and BACK option to the end
+    ARGS+=("---" "---------------------------------------")
+    ARGS+=("BACK" "<- Return to previous menu")
 
-    if [ $ret -ne 0 ]; then return 1; fi
+    local DEVICE=""
+    while true; do
+        local ret=0
+        whiptail --title "$title" --cancel-button "Back" --menu "Select the SD card device:" 15 60 7 -- "${ARGS[@]}" 2> "$tempfile" || ret=$?
+        DEVICE=$(cat "$tempfile")
+        rm -f "$tempfile"
+
+        if [ $ret -ne 0 ] || [ "$DEVICE" = "BACK" ]; then
+            return 1
+        elif [ "$DEVICE" = "---" ]; then
+            continue
+        else
+            break
+        fi
+    done
     RET_VAL="/dev/$DEVICE"
     return 0
 }
@@ -115,8 +134,8 @@ select_devices_multiple() {
         return 1
     fi
 
-    whiptail --title "$title" --checklist "Select SD cards to flash (SPACE to select):" 15 70 5 "${ARGS[@]}" 2> "$tempfile"
-    local ret=$?
+    local ret=0
+    whiptail --title "$title" --cancel-button "Back" --checklist "Select SD cards to flash (SPACE to select):" 15 70 5 "${ARGS[@]}" 2> "$tempfile" || ret=$?
     local SELECTED=$(cat "$tempfile")
     rm -f "$tempfile"
 
@@ -132,8 +151,7 @@ select_devices_multiple() {
 
 # --- 1. FORMAT FUNCTION ---
 format_sd() {
-    select_device "Format SD Card"
-    [ $? -ne 0 ] && return
+    select_device "Format SD Card" || return 0
     local TARGET="$RET_VAL"
 
     if whiptail --title "WARNING" --yesno "ALL DATA ON $TARGET WILL BE ERASED!\nAre you absolutely sure?" 10 60; then
@@ -150,13 +168,12 @@ format_sd() {
 
 # --- 2. SMART BACKUP & OPTIMIZE ---
 create_backup() {
-    select_device "Source for Backup"
-    [ $? -ne 0 ] && return
+    select_device "Source for Backup" || return 0
     local TARGET="$RET_VAL"
 
     local tempfile=$(mktemp)
-    whiptail --title "Backup Name" --inputbox "Enter a name for your backup (leave empty for default):" 10 60 2> "$tempfile"
-    local ret=$?
+    local ret=0
+    whiptail --title "Backup Name" --cancel-button "Back" --inputbox "Enter a name for your backup (leave empty for default):" 10 60 2> "$tempfile" || ret=$?
     local CUSTOM_NAME=$(cat "$tempfile")
     rm -f "$tempfile"
 
@@ -187,7 +204,9 @@ create_backup() {
 
     clear
     log_msg "PROCESS" "Step 1: Copying full SD card $TARGET -> ${FINAL_NAME}.img..."
-    dd if="$TARGET" of="$RAW_IMG" bs=4M status=progress conv=fsync
+    local DEV_SIZE=$(blockdev --getsize64 "$TARGET")
+    pv -tpreb -s "$DEV_SIZE" "$TARGET" > "$RAW_IMG"
+    sync
 
     log_msg "PROCESS" "Step 2: Mounting image filesystem via loop device..."
     LOOP=$(losetup -fP --show "$RAW_IMG")
@@ -196,12 +215,13 @@ create_backup() {
     local ROOT_PART=$(basename "$ROOT_DEV")
 
     log_msg "INFO" "Checking root filesystem integrity on $ROOT_DEV..."
-    e2fsck -fy "$ROOT_DEV"
+    e2fsck -fy "$ROOT_DEV" || [ $? -le 2 ]
 
     log_msg "INFO" "Zeroing free space for maximum GZIP compression layout..."
     MOUNT_PT=$(mktemp -d)
     mount "$ROOT_DEV" "$MOUNT_PT"
-    cat /dev/zero > "$MOUNT_PT/zero.file" 2>/dev/null || true
+    local FREE_SPACE=$(df -B1 "$MOUNT_PT" | tail -n 1 | awk '{print $4}')
+    pv -tpreb -s "$FREE_SPACE" /dev/zero > "$MOUNT_PT/zero.file" || true
     rm -f "$MOUNT_PT/zero.file"
 
     log_msg "INFO" "Injecting native filesystem auto-expand triggers..."
@@ -234,7 +254,7 @@ EOF
     MOUNT_PT=""
 
     log_msg "INFO" "Final filesystem check before truncation..."
-    e2fsck -fy "$ROOT_DEV"
+    e2fsck -fy "$ROOT_DEV" || [ $? -le 2 ]
 
     log_msg "PROCESS" "Optimizing ext4 partition filesystem to minimum boundary..."
     resize2fs -M "$ROOT_DEV"
@@ -255,7 +275,8 @@ EOF
 
     log_msg "PROCESS" "Cutting off trailing unallocated raw bytes and compressing..."
     truncate -s "$((NEW_END + 10485760))" "$RAW_IMG"
-    gzip -f "$RAW_IMG"
+    pv "$RAW_IMG" | gzip > "${RAW_IMG}.gz"
+    rm -f "$RAW_IMG"
 
     chown "$REAL_USER:$REAL_USER" "${RAW_IMG}.gz"
     trap - EXIT INT TERM ERR
@@ -267,22 +288,41 @@ EOF
 flash_image() {
     local FILES=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "*.img" -o -name "*.gz" \))
     if [ -z "$FILES" ]; then
-        whiptail --msgbox "No images found in $BACKUP_DIR" 8 45; return
+        whiptail --msgbox "No images found in $BACKUP_DIR" 8 45; return 0
     fi
     local ARGS=()
     while read -r path; do
-        [ -n "$path" ] && ARGS+=("$path" "$(basename "$path")")
+        if [ -n "$path" ]; then
+            local filename=$(basename "$path")
+            local desc="Raw Image"
+            if [[ "$filename" =~ \.gz$ ]]; then
+                desc="Compressed"
+            fi
+            ARGS+=("$filename" "$desc")
+        fi
     done <<< "$FILES"
+    ARGS+=("---" "---------------------------------------")
+    ARGS+=("BACK" "<- Return to previous menu")
 
-    local tempfile=$(mktemp)
-    whiptail --title "Select Image" --menu "Choose image to flash:" 15 80 5 "${ARGS[@]}" 2> "$tempfile"
-    local ret=$?
-    local IMG_PATH=$(cat "$tempfile")
-    rm -f "$tempfile"
-    if [ $ret -ne 0 ]; then return; fi
+    local SELECTED_FILE=""
+    while true; do
+        local tempfile=$(mktemp)
+        local ret=0
+        whiptail --title "Select Image" --cancel-button "Back" --menu "Choose image to flash (from $BACKUP_DIR):" 15 80 7 -- "${ARGS[@]}" 2> "$tempfile" || ret=$?
+        SELECTED_FILE=$(cat "$tempfile")
+        rm -f "$tempfile"
 
-    select_devices_multiple "Select Flash Destinations"
-    [ $? -ne 0 ] && return
+        if [ $ret -ne 0 ] || [ "$SELECTED_FILE" = "BACK" ]; then
+            return 0
+        elif [ "$SELECTED_FILE" = "---" ]; then
+            continue
+        else
+            break
+        fi
+    done
+    local IMG_PATH="$BACKUP_DIR/$SELECTED_FILE"
+
+    select_devices_multiple "Select Flash Destinations" || return 0
     local TARGETS="$RET_VAL"
 
     local TARGETS_PRETTY=$(echo "$TARGETS" | tr ' ' '\n')
@@ -441,7 +481,10 @@ EOF
 
         local i=0
         for dev in $TARGETS; do
-            if [ $i -gt 0 ]; then tmux split-window -h; fi
+            if [ $i -gt 0 ]; then
+                tmux split-window -h
+                tmux select-layout tiled
+            fi
             tmux send-keys "sudo /tmp/sd_flash_worker.sh '$IMG_PATH' '$dev'; echo 'Press Enter to close this window...'; read; exit" C-m
             i=$((i+1))
         done
@@ -456,26 +499,66 @@ EOF
 optimize_existing_image() {
     local FILES=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name "*.img")
     if [ -z "$FILES" ]; then
-        whiptail --msgbox "No raw .img files found in $BACKUP_DIR" 8 45; return
+        whiptail --msgbox "No raw .img files found in $BACKUP_DIR" 8 45; return 0
     fi
     local ARGS=()
     while read -r path; do
-        [ -n "$path" ] && ARGS+=("$path" "$(basename "$path")")
+        [ -n "$path" ] && ARGS+=("$(basename "$path")" "Raw Image")
     done <<< "$FILES"
+    ARGS+=("---" "---------------------------------------")
+    ARGS+=("BACK" "<- Return to previous menu")
 
-    local tempfile=$(mktemp)
-    whiptail --title "Select Image" --menu "Choose image to optimize/compress:" 15 80 5 "${ARGS[@]}" 2> "$tempfile"
-    local ret=$?
-    local IMG_PATH=$(cat "$tempfile")
-    rm -f "$tempfile"
-    if [ $ret -ne 0 ]; then return; fi
+    local SELECTED_FILE=""
+    while true; do
+        local tempfile=$(mktemp)
+        local ret=0
+        whiptail --title "Select Image" --cancel-button "Back" --menu "Choose image to optimize/compress (from $BACKUP_DIR):" 15 80 7 -- "${ARGS[@]}" 2> "$tempfile" || ret=$?
+        SELECTED_FILE=$(cat "$tempfile")
+        rm -f "$tempfile"
+
+        if [ $ret -ne 0 ] || [ "$SELECTED_FILE" = "BACK" ]; then
+            return 0
+        elif [ "$SELECTED_FILE" = "---" ]; then
+            continue
+        else
+            break
+        fi
+    done
+    local IMG_PATH="$BACKUP_DIR/$SELECTED_FILE"
 
     local tempfile_part=$(mktemp)
-    whiptail --title "Root Partition" --inputbox "Enter the root partition number (e.g. 1 for Armbian/Orange Pi, 2 for Raspberry Pi):" 10 60 "1" 2> "$tempfile_part"
-    local ret_part=$?
-    local PART_NUM=$(cat "$tempfile_part")
-    rm -f "$tempfile_part"
-    if [ $ret_part -ne 0 ]; then return; fi
+    local CHOICE_PART=""
+    while true; do
+        local ret_part=0
+        whiptail --title "Select Platform" --cancel-button "Back" --menu "Choose your platform (determines the root partition):" 15 65 5 -- \
+        "1" "Armbian / Orange Pi (Partition 1)" \
+        "2" "Raspberry Pi OS (Partition 2)" \
+        "custom" "Custom Partition Number" \
+        "---" "---------------------------------------" \
+        "BACK" "<- Return to previous menu" 2> "$tempfile_part" || ret_part=$?
+        CHOICE_PART=$(cat "$tempfile_part")
+        rm -f "$tempfile_part"
+
+        if [ $ret_part -ne 0 ] || [ "$CHOICE_PART" = "BACK" ]; then
+            return 0
+        elif [ "$CHOICE_PART" = "---" ]; then
+            continue
+        else
+            break
+        fi
+    done
+
+    local PART_NUM=""
+    if [ "$CHOICE_PART" = "custom" ]; then
+        local tempfile_custom=$(mktemp)
+        local ret_custom=0
+        whiptail --title "Custom Partition" --cancel-button "Back" --inputbox "Enter the root partition number manually:" 10 60 "1" 2> "$tempfile_custom" || ret_custom=$?
+        PART_NUM=$(cat "$tempfile_custom")
+        rm -f "$tempfile_custom"
+        if [ $ret_custom -ne 0 ]; then return; fi
+    else
+        PART_NUM="$CHOICE_PART"
+    fi
     if [ -z "$PART_NUM" ]; then PART_NUM=1; fi
 
     local LOOP=""
@@ -503,12 +586,13 @@ optimize_existing_image() {
     local ROOT_PART=$(basename "$ROOT_DEV")
 
     log_msg "INFO" "Checking root filesystem integrity on $ROOT_DEV..."
-    e2fsck -fy "$ROOT_DEV"
+    e2fsck -fy "$ROOT_DEV" || [ $? -le 2 ]
 
     log_msg "INFO" "Zeroing free space blocks allocation layout..."
     MOUNT_PT=$(mktemp -d)
     mount "$ROOT_DEV" "$MOUNT_PT"
-    cat /dev/zero > "$MOUNT_PT/zero.file" 2>/dev/null || true
+    local FREE_SPACE=$(df -B1 "$MOUNT_PT" | tail -n 1 | awk '{print $4}')
+    pv -tpreb -s "$FREE_SPACE" /dev/zero > "$MOUNT_PT/zero.file" || true
     rm -f "$MOUNT_PT/zero.file"
 
     log_msg "INFO" "Injecting native filesystem auto-expand triggers..."
@@ -541,7 +625,7 @@ EOF
     MOUNT_PT=""
 
     log_msg "INFO" "Ensuring clean system table structure before optimization process execution..."
-    e2fsck -fy "$ROOT_DEV"
+    e2fsck -fy "$ROOT_DEV" || [ $? -le 2 ]
 
     log_msg "PROCESS" "Compacting file system volume parameters..."
     resize2fs -M "$ROOT_DEV"
@@ -559,9 +643,9 @@ EOF
     parted -s "$IMG_PATH" rm "$PART_NUM"
     parted -s "$IMG_PATH" unit B mkpart primary "$PART_START" "$NEW_END"
 
-    log_msg "PROCESS" "Truncating dead zero bytes structure blocks..."
+    log_msg "PROCESS" "Truncating dead zero bytes structure blocks and compressing..."
     truncate -s "$((NEW_END + 10485760))" "$IMG_PATH"
-    gzip -c "$IMG_PATH" > "${IMG_PATH}.gz"
+    pv "$IMG_PATH" | gzip > "${IMG_PATH}.gz"
 
     chown "$REAL_USER:$REAL_USER" "${IMG_PATH}.gz"
     trap - EXIT INT TERM ERR
@@ -574,14 +658,13 @@ check_dependencies
 
 while true; do
     tempfile=$(mktemp)
+    ret=0
     whiptail --title "Image Provisioning Tool" --menu "Main Menu" 15 60 5 \
     "1" "Create Optimized Backup (Auto-size)" \
     "2" "Parallel Restore Image to SDs" \
     "3" "Format Target (FAT32)" \
     "4" "Optimize & Compress Existing Image" \
-    "5" "Exit" 2> "$tempfile"
-
-    ret=$?
+    "5" "Exit" 2> "$tempfile" || ret=$?
     CHOICE=$(cat "$tempfile")
     rm -f "$tempfile"
 
