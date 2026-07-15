@@ -13,7 +13,7 @@ A single-file, interactive Bash utility for managing SD card images. Designed fo
 | **Auto-Expand on First Boot** | Injects Armbian's native resizer or a one-shot `systemd` service for Raspberry Pi OS |
 | **Format (FAT32)** | Wipes and formats a device with a clean MBR + FAT32 partition |
 | **Optimize Existing Image** | Shrinks and compresses an existing raw `.img` file without re-reading a physical device |
-| **Real-time Progress** | Python-powered write loop with live `[##----] 42.1% | 1.23/8.00 GB | 18.4 MB/s | ETA: 05:21` display |
+| **Real-time Progress** | Live progress bars via `pv` and Python for copying, zeroing free space, compressing, and flashing |
 | **Dependency Auto-install** | Checks and silently installs missing Debian/Ubuntu packages on first run |
 | **Structured Logging** | Timestamped `[HH:MM:SS] [LEVEL] message` log written to `sd_manager.log` |
 
@@ -36,6 +36,7 @@ A single-file, interactive Bash utility for managing SD card images. Designed fo
 | `dosfstools` | `mkfs.vfat` for FAT32 formatting |
 | `python3` | Real-time progress display during flash |
 | `tmux` | Split-pane parallel flashing sessions |
+| `pv` | Real-time progress bar for card copying, zeroing, and compression |
 
 ---
 
@@ -79,9 +80,9 @@ The interactive main menu will appear:
 1. Select the source SD card from the device list (only removable devices are shown).
 2. Enter an optional backup name (default: `sd_backup_YYYYMMDD_HHMM`).
 3. The script automatically:
-   - Copies the full device with `dd`.
+   - Copies the full device with `pv` (showing progress bar, speed, ETA, and final `sync`).
    - Mounts the image via a loop device.
-   - Zeros free space to maximize `gzip` compression ratio.
+   - Zeros free space with a progress bar to maximize `gzip` compression ratio.
    - Detects the OS and injects auto-expand triggers:
      - **Armbian**: removes `.no_automatic_fs_resize` to activate the native daemon.
      - **Raspberry Pi OS**: installs a one-shot `rpi-expandfs.service` systemd unit.
@@ -128,9 +129,9 @@ The interactive main menu will appear:
 
 **Menu option 4** — Shrinks and compresses a raw `.img` file you already have, without needing a physical device.
 
-- Select an existing `.img` from `images/`.
-- Specify the root partition number (default `1`; use `2` for Raspberry Pi OS).
-- Same shrink/compress pipeline as the backup: zeros free space → `resize2fs -M` → truncate → `gzip`.
+- Select an existing `.img` from `images/` (cleaned of absolute paths for UI readability).
+- Select your platform (Orange Pi/Armbian (partition 1), Raspberry Pi OS (partition 2), or enter a custom partition number).
+- Same shrink/compress pipeline as the backup: zeros free space → `resize2fs -M` → truncate → `gzip` (all with `pv` progress bars).
 - The original `.img` is **preserved**; the compressed copy is saved as `<name>.img.gz`.
 
 ---
@@ -179,6 +180,20 @@ Log levels used: `INFO`, `PROCESS`.
 | **Raspberry Pi OS** | ✅ One-shot `rpi-expandfs.service` injected |
 | **Other Linux (ext4)** | ✅ Filesystem expanded on host at flash time |
 | **FAT32-only images** | ⚠️ No filesystem expansion (format tool only) |
+
+---
+
+## ⌨️ UI Navigation & Keyboard Shortcuts
+
+The script forces an English locale (`LC_ALL=C.UTF-8`) for standard button consistency and supports standard console TUI shortcuts:
+* **`Tab`**: Move focus between the menu list and the bottom buttons (`<Ok>` / `<Back>`).
+* **Left / Right Arrow Keys**: Move between bottom buttons when they are focused.
+* **Up / Down Arrow Keys**: Navigate choices inside lists.
+* **`Spacebar`**: Toggle checklist checkboxes (for target devices selection).
+* **`Enter`**: Accept the current choice. Pressing `Enter` on a menu item automatically acts as `<Ok>` for that item (no need to Tab down to the button).
+* **`Esc`**: Returns to the previous step/menu.
+
+If your terminal or tmux session captures the `Tab` key, you can use the **`BACK`** menu option added at the bottom of lists (separated by `---`) and press `Enter` to go back.
 
 ---
 
