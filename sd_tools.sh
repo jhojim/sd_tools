@@ -70,6 +70,34 @@ check_dependencies() {
     fi
 }
 
+# Zero the free space of EVERY ext4 partition on a loop device so gzip can squeeze the image.
+# Multi-partition images (e.g. root + separate data partition) used to get only their last
+# partition zeroed, leaving old file residue in the root partition's free blocks.
+zero_free_space_all() {
+    local loop="$1"
+    local part fstype mp free
+    # Right after losetup the udev database may not know the filesystem types yet, so ask blkid
+    # for each partition instead of trusting lsblk's FSTYPE column.
+    udevadm settle 2>/dev/null || true
+    partprobe "$loop" 2>/dev/null || true
+    log_msg "INFO" "Partitions on $loop: $(lsblk -lno NAME -p "$loop" | grep -v "^$loop$" | tr '\n' ' ')"
+    for part in $(lsblk -lno NAME -p "$loop" | grep -v "^$loop$"); do
+        fstype=$(blkid -o value -s TYPE "$part" 2>/dev/null || true)
+        [ "$fstype" = "ext4" ] || { log_msg "INFO" "Skipping $part (${fstype:-no filesystem}): only ext4 free space is zeroed"; continue; }
+        log_msg "INFO" "Checking filesystem integrity on $part..."
+        e2fsck -fy "$part" || [ $? -le 2 ]
+        mp=$(mktemp -d)
+        mount "$part" "$mp"
+        free=$(df -B1 "$mp" | tail -n 1 | awk '{print $4}')
+        log_msg "INFO" "Zeroing free space on $part ($(numfmt --to=iec "$free" 2>/dev/null || echo "$free B") free)..."
+        pv -tpreb -s "$free" /dev/zero > "$mp/zero.file" || true
+        rm -f "$mp/zero.file"
+        sync
+        umount "$mp"
+        rmdir "$mp"
+    done
+}
+
 # --- UI FUNCTIONS (BULLETPROOF) ---
 select_device() {
     local title="$1"
@@ -214,17 +242,15 @@ create_backup() {
     local ROOT_DEV=$(lsblk -lno NAME -p "$LOOP" | grep -v "^$LOOP$" | tail -n 1)
     local ROOT_PART=$(basename "$ROOT_DEV")
 
-    log_msg "INFO" "Checking root filesystem integrity on $ROOT_DEV..."
-    e2fsck -fy "$ROOT_DEV" || [ $? -le 2 ]
+    zero_free_space_all "$LOOP"
 
-    log_msg "INFO" "Zeroing free space for maximum GZIP compression layout..."
+    # The last partition is the one that grows to fill the card at flash time. On single-root images
+    # that is the root filesystem; on root + data images it is the data partition, which carries no
+    # OS and therefore gets no auto-expand trigger (the host-side flasher grows it anyway).
     MOUNT_PT=$(mktemp -d)
     mount "$ROOT_DEV" "$MOUNT_PT"
-    local FREE_SPACE=$(df -B1 "$MOUNT_PT" | tail -n 1 | awk '{print $4}')
-    pv -tpreb -s "$FREE_SPACE" /dev/zero > "$MOUNT_PT/zero.file" || true
-    rm -f "$MOUNT_PT/zero.file"
 
-    log_msg "INFO" "Injecting native filesystem auto-expand triggers..."
+    log_msg "INFO" "Injecting native filesystem auto-expand triggers (last partition only)..."
     if [ -f "$MOUNT_PT/usr/sbin/armbian-resize-firstboot" ] || [ -f "$MOUNT_PT/lib/armbian/armbian-resize-firstboot" ]; then
         log_msg "INFO" "Armbian detected. Activating native first-boot resizer daemon."
         rm -f "$MOUNT_PT/root/.no_automatic_fs_resize" 2>/dev/null || true
@@ -585,17 +611,12 @@ optimize_existing_image() {
     local ROOT_DEV="${LOOP}p${PART_NUM}"
     local ROOT_PART=$(basename "$ROOT_DEV")
 
-    log_msg "INFO" "Checking root filesystem integrity on $ROOT_DEV..."
-    e2fsck -fy "$ROOT_DEV" || [ $? -le 2 ]
+    zero_free_space_all "$LOOP"
 
-    log_msg "INFO" "Zeroing free space blocks allocation layout..."
     MOUNT_PT=$(mktemp -d)
     mount "$ROOT_DEV" "$MOUNT_PT"
-    local FREE_SPACE=$(df -B1 "$MOUNT_PT" | tail -n 1 | awk '{print $4}')
-    pv -tpreb -s "$FREE_SPACE" /dev/zero > "$MOUNT_PT/zero.file" || true
-    rm -f "$MOUNT_PT/zero.file"
 
-    log_msg "INFO" "Injecting native filesystem auto-expand triggers..."
+    log_msg "INFO" "Injecting native filesystem auto-expand triggers (selected partition only)..."
     if [ -f "$MOUNT_PT/usr/sbin/armbian-resize-firstboot" ] || [ -f "$MOUNT_PT/lib/armbian/armbian-resize-firstboot" ]; then
         log_msg "INFO" "Armbian detected. Activating native first-boot resizer daemon."
         rm -f "$MOUNT_PT/root/.no_automatic_fs_resize" 2>/dev/null || true
