@@ -327,7 +327,8 @@ EOF
 
 # --- 3. PARALLEL RESTORE & AUTO-EXPAND ---
 flash_image() {
-    local FILES=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "*.img" -o -name "*.gz" \))
+    # Only disk images: a stray release tarball (*.tar.gz) must never be offered for flashing.
+    local FILES=$(find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "*.img" -o -name "*.img.gz" \))
     if [ -z "$FILES" ]; then
         whiptail --msgbox "No images found in $BACKUP_DIR" 8 45; return 0
     fi
@@ -429,6 +430,15 @@ try:
     else:
         total_size = os.path.getsize(img_path)
 
+    # Refuse anything that is not a disk image: the first sector must carry the MBR signature
+    # (a GPT image has a protective MBR, so the same check covers both).
+    probe = gzip.open(img_path, "rb") if img_path.endswith(".gz") else open(img_path, "rb")
+    first = probe.read(512)
+    probe.close()
+    if len(first) < 512 or first[510:512] != b"\x55\xaa":
+        print(f"\nERROR: {os.path.basename(img_path)} is not a disk image (no MBR/GPT signature in the first sector). Nothing was written.", file=sys.stderr)
+        sys.exit(2)
+
     if img_path.endswith(".gz"):
         src = gzip.open(img_path, "rb")
     else:
@@ -500,15 +510,28 @@ else
     HOST_PART_DEV="${TARGET}${HOST_PART_NUM}"
 fi
 
+fail() {
+    echo "============================================"
+    echo "FAILED: $1"
+    echo "The card may be unusable until it is flashed again."
+    echo "============================================"
+    exit 1
+}
+
+[ -n "$HOST_PART_NUM" ] || fail "no partition found on $TARGET after flashing (not a disk image?)"
 echo "Expanding partition table slot $HOST_PART_NUM on $TARGET to 100% boundary..."
-parted -s "$TARGET" resizepart "$HOST_PART_NUM" 100%
+parted -s "$TARGET" resizepart "$HOST_PART_NUM" 100% || fail "could not expand partition $HOST_PART_NUM on $TARGET"
 
 partprobe "$TARGET" || true
 sleep 1
 
-echo "Growing target ext4 filesystem maps live on $HOST_PART_DEV..."
-e2fsck -fy "$HOST_PART_DEV" || true
-resize2fs "$HOST_PART_DEV"
+if [ "$(blkid -o value -s TYPE "$HOST_PART_DEV" 2>/dev/null)" = "ext4" ]; then
+    echo "Growing target ext4 filesystem maps live on $HOST_PART_DEV..."
+    e2fsck -fy "$HOST_PART_DEV" || [ $? -le 2 ] || fail "filesystem check failed on $HOST_PART_DEV"
+    resize2fs "$HOST_PART_DEV" || fail "could not grow the filesystem on $HOST_PART_DEV"
+else
+    echo "Last partition $HOST_PART_DEV is not ext4; partition expanded, filesystem left as is."
+fi
 
 echo "============================================"
 echo "SUCCESS! $TARGET is fully flashed and expanded."
