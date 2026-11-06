@@ -78,10 +78,18 @@ zero_free_space_all() {
     local part fstype mp free
     # Right after losetup the udev database may not know the filesystem types yet, so ask blkid
     # for each partition instead of trusting lsblk's FSTYPE column.
-    udevadm settle 2>/dev/null || true
-    partprobe "$loop" 2>/dev/null || true
-    log_msg "INFO" "Partitions on $loop: $(lsblk -lno NAME -p "$loop" | grep -v "^$loop$" | tr '\n' ' ')"
-    for part in $(lsblk -lno NAME -p "$loop" | grep -v "^$loop$"); do
+    # losetup -P already scanned the table; never partprobe a loop device here (it can drop the
+    # partition nodes). Give udev a moment and fall back to the /dev nodes if lsblk is still empty.
+    local parts="" attempt
+    for attempt in 1 2 3 4 5; do
+        udevadm settle 2>/dev/null || true
+        parts=$(lsblk -lno NAME -p "$loop" 2>/dev/null | grep -v "^$loop$" || true)
+        [ -n "$parts" ] && break
+        sleep 1
+    done
+    [ -n "$parts" ] || parts=$(ls "${loop}p"* 2>/dev/null || true)
+    log_msg "INFO" "Partitions on $loop: $(echo $parts)"
+    for part in $parts; do
         fstype=$(blkid -o value -s TYPE "$part" 2>/dev/null || true)
         [ "$fstype" = "ext4" ] || { log_msg "INFO" "Skipping $part (${fstype:-no filesystem}): only ext4 free space is zeroed"; continue; }
         log_msg "INFO" "Checking filesystem integrity on $part..."
@@ -296,8 +304,15 @@ EOF
     losetup -d "$LOOP"
     LOOP=""
 
-    parted -s "$RAW_IMG" rm "$PART_NUM"
-    parted -s "$RAW_IMG" unit B mkpart primary "$PART_START" "$NEW_END"
+    # Rewrite only the size of the existing table entry, in one atomic sfdisk write. The old
+    # "parted rm + mkpart" pair left the image with an EMPTY partition table whenever mkpart failed,
+    # e.g. on an already-minimal image whose file ends right at the filesystem: the new end plus
+    # the safety margin fell outside the file. Grow the (sparse) file first so the end always fits.
+    local IMG_BYTES; IMG_BYTES=$(stat -c %s "$RAW_IMG")
+    if [ "$((NEW_END + 10485760))" -gt "$IMG_BYTES" ]; then
+        truncate -s "$((NEW_END + 10485760))" "$RAW_IMG"
+    fi
+    echo ",$(( (NEW_END - PART_START) / 512 ))" | sfdisk --quiet --no-reread -N "$PART_NUM" "$RAW_IMG"
 
     log_msg "PROCESS" "Cutting off trailing unallocated raw bytes and compressing..."
     truncate -s "$((NEW_END + 10485760))" "$RAW_IMG"
@@ -661,8 +676,15 @@ EOF
     losetup -d "$LOOP"
     LOOP=""
 
-    parted -s "$IMG_PATH" rm "$PART_NUM"
-    parted -s "$IMG_PATH" unit B mkpart primary "$PART_START" "$NEW_END"
+    # Rewrite only the size of the existing table entry, in one atomic sfdisk write. The old
+    # "parted rm + mkpart" pair left the image with an EMPTY partition table whenever mkpart failed,
+    # e.g. on an already-minimal image whose file ends right at the filesystem: the new end plus
+    # the safety margin fell outside the file. Grow the (sparse) file first so the end always fits.
+    local IMG_BYTES; IMG_BYTES=$(stat -c %s "$IMG_PATH")
+    if [ "$((NEW_END + 10485760))" -gt "$IMG_BYTES" ]; then
+        truncate -s "$((NEW_END + 10485760))" "$IMG_PATH"
+    fi
+    echo ",$(( (NEW_END - PART_START) / 512 ))" | sfdisk --quiet --no-reread -N "$PART_NUM" "$IMG_PATH"
 
     log_msg "PROCESS" "Truncating dead zero bytes structure blocks and compressing..."
     truncate -s "$((NEW_END + 10485760))" "$IMG_PATH"
