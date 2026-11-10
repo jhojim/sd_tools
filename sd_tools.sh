@@ -34,6 +34,9 @@ REAL_USER=${SUDO_USER:-$USER}
 # Global variable to safely return values from UI functions
 RET_VAL=""
 
+# Delay (seconds) between starting each card in a parallel flash
+STAGGER_DELAY=2
+
 # Create local image directory if it doesn't exist and fix permissions
 if [ ! -d "$BACKUP_DIR" ]; then
     mkdir -p "$BACKUP_DIR"
@@ -153,6 +156,8 @@ select_device() {
 
 select_devices_multiple() {
     local title="$1"
+    local prompt="${2:-Select SD cards to flash (SPACE to select):}"
+    local default_state="${3:-OFF}"
     local tempfile=$(mktemp)
     local DEVICES_LIST=$(lsblk -d -P -o NAME,SIZE,RM,MODEL -e 7)
     local ARGS=()
@@ -160,7 +165,7 @@ select_devices_multiple() {
     while read -r line; do
         eval "$line"
         if [ "$RM" == "1" ] && [ "$SIZE" != "0B" ] && [ -n "$SIZE" ]; then
-            ARGS+=("$NAME" "$SIZE $MODEL" "OFF")
+            ARGS+=("$NAME" "$SIZE $MODEL" "$default_state")
         fi
     done <<< "$DEVICES_LIST"
 
@@ -171,7 +176,7 @@ select_devices_multiple() {
     fi
 
     local ret=0
-    whiptail --title "$title" --cancel-button "Back" --checklist "Select SD cards to flash (SPACE to select):" 15 70 5 "${ARGS[@]}" 2> "$tempfile" || ret=$?
+    whiptail --title "$title" --cancel-button "Back" --checklist "$prompt" 15 70 5 "${ARGS[@]}" 2> "$tempfile" || ret=$?
     local SELECTED=$(cat "$tempfile")
     rm -f "$tempfile"
 
@@ -370,8 +375,12 @@ flash_image() {
     local TARGETS_PRETTY=$(echo "$TARGETS" | tr ' ' '\n')
 
     if whiptail --title "CRITICAL WARNING" --yesno "THIS WILL ERASE EVERYTHING ON:\n$TARGETS_PRETTY\nFlash $IMG_PATH to selected targets?" 15 70; then
+        # Starting every card at once can overload a shared USB hub and reset
+        # the readers (EIO on all in-flight writes), so start them one by one.
+        local STAGGER=$STAGGER_DELAY
+
         clear
-        log_msg "PROCESS" "Starting parallel flashing of $IMG_PATH to multiple targets..."
+        log_msg "PROCESS" "Starting parallel flashing of $IMG_PATH to multiple targets (${STAGGER}s between starts)..."
 
         cat << 'EOF' > /tmp/sd_flash_worker.sh
 #!/bin/bash
@@ -549,7 +558,12 @@ EOF
                 tmux split-window -h
                 tmux select-layout tiled
             fi
-            tmux send-keys "sudo /tmp/sd_flash_worker.sh '$IMG_PATH' '$dev'; echo 'Press Enter to close this window...'; read; exit" C-m
+            local delay=$((i * STAGGER))
+            local wait_cmd=""
+            if [ $delay -gt 0 ]; then
+                wait_cmd="echo 'Waiting ${delay}s before starting $dev (staggered start)...'; sleep $delay; "
+            fi
+            tmux send-keys "${wait_cmd}sudo /tmp/sd_flash_worker.sh '$IMG_PATH' '$dev'; echo 'Press Enter to close this window...'; read; exit" C-m
             i=$((i+1))
         done
 
@@ -719,18 +733,59 @@ EOF
     whiptail --title "Success" --msgbox "Optimization & Compression completed!\nSaved to: ${IMG_PATH}.gz" 10 60
 }
 
+# --- 5. SAFELY UNMOUNT SD CARDS ---
+unmount_cards() {
+    select_devices_multiple "Safely Unmount SD Cards" "Select cards to unmount (SPACE to toggle):" "ON" || return 0
+    local TARGETS="$RET_VAL"
+
+    clear
+    log_msg "PROCESS" "Unmounting cards: $TARGETS"
+    sync
+
+    local REPORT="" FAILED=0
+    for dev in $TARGETS; do
+        if pgrep -f "sd_flash_worker.sh .* $dev\$" > /dev/null; then
+            REPORT+="$dev: SKIPPED, flashing is still running\n"
+            FAILED=1
+            continue
+        fi
+
+        local ok=1
+        for part in $(lsblk -lnpo NAME "$dev" | tail -n +2); do
+            if findmnt -rn -S "$part" > /dev/null; then
+                umount "$part" 2>/dev/null || umount -l "$part" 2>/dev/null || ok=0
+            fi
+        done
+        blockdev --flushbufs "$dev" 2>/dev/null || true
+
+        if [ $ok -eq 1 ]; then
+            REPORT+="$dev: safe to remove\n"
+            log_msg "INFO" "$dev unmounted and flushed"
+        else
+            REPORT+="$dev: FAILED to unmount, a partition is still busy\n"
+            log_msg "ERROR" "Could not unmount every partition of $dev"
+            FAILED=1
+        fi
+    done
+
+    local title="Done"
+    [ $FAILED -eq 1 ] && title="Some cards are not ready"
+    whiptail --title "$title" --msgbox "$REPORT" 16 65
+}
+
 # --- MAIN EXECUTION LOOP ---
 check_dependencies
 
 while true; do
     tempfile=$(mktemp)
     ret=0
-    whiptail --title "Image Provisioning Tool" --menu "Main Menu" 15 60 5 \
+    whiptail --title "Image Provisioning Tool" --menu "Main Menu" 16 60 6 \
     "1" "Create Optimized Backup (Auto-size)" \
     "2" "Parallel Restore Image to SDs" \
     "3" "Format Target (FAT32)" \
     "4" "Optimize & Compress Existing Image" \
-    "5" "Exit" 2> "$tempfile" || ret=$?
+    "5" "Safely Unmount SD Cards" \
+    "6" "Exit" 2> "$tempfile" || ret=$?
     CHOICE=$(cat "$tempfile")
     rm -f "$tempfile"
 
@@ -741,6 +796,7 @@ while true; do
         "2") flash_image ;;
         "3") format_sd ;;
         "4") optimize_existing_image ;;
-        "5"|*) exit 0 ;;
+        "5") unmount_cards ;;
+        "6"|*) exit 0 ;;
     esac
 done
